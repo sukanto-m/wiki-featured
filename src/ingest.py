@@ -2,327 +2,245 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import logging
 import os
 import sqlite3
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import requests
 
-FEED_URL = "https://api.wikimedia.org/feed/v1/wikipedia/{lang}/featured/{yyyy}/{mm}/{dd}"
-DEFAULT_UA = "wiki-featured-crawler/0.1 (personal project; contact: you@example.com)"
+# ================== CONSTANTS ==================
 
+MOST_READ_DAY_URL = (
+    "https://api.wikimedia.org/feed/v1/wikipedia/{lang}/most-read/{yyyy}/{mm}/{dd}"
+)
+DEFAULT_UA = "wiki-attention-archive/1.1 (github project)"
+LOOKBACK_DAYS = 7  # how far back to probe for latest available data
+
+# ================== MODELS ==================
 
 @dataclass(frozen=True)
 class Row:
-    date: str        # YYYY-MM-DD
-    section: str     # tfa | news_story | news_link | dyk | onthisday
+    date: str
+    section: str
     title: str
-    text: str
+    extra: str
     url: str
 
+# ================== LOGGING ==================
 
 def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("wiki-featured")
+    logger = logging.getLogger("wiki-archive")
     logger.setLevel(logging.INFO)
-
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(message)s",
+            "%Y-%m-%d %H:%M:%S",
+        )
     )
-    handler.setFormatter(formatter)
-
     if not logger.handlers:
         logger.addHandler(handler)
-
     return logger
 
+# ================== HELPERS ==================
 
-def _try_import_pandas():
-    try:
-        import pandas as pd  # type: ignore
-        return pd
-    except Exception:
-        return None
-
-
-def daterange(start: dt.date, end: dt.date) -> Iterable[dt.date]:
-    d = start
-    while d <= end:
-        yield d
-        d += dt.timedelta(days=1)
-
-
-def parse_date(s: str) -> dt.date:
-    return dt.datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def safe_get(d: Dict[str, Any], *path: str) -> Optional[Any]:
-    cur: Any = d
-    for p in path:
-        if not isinstance(cur, dict) or p not in cur:
-            return None
-        cur = cur[p]
-    return cur
-
-
-def fetch_featured(lang: str, day: dt.date, user_agent: str) -> Dict[str, Any]:
-    url = FEED_URL.format(
-        lang=lang,
-        yyyy=day.strftime("%Y"),
-        mm=day.strftime("%m"),
-        dd=day.strftime("%d"),
-    )
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "application/json",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
+def fetch_json(url: str, ua: str) -> Dict[str, Any]:
+    r = requests.get(url, headers={"User-Agent": ua}, timeout=30)
     r.raise_for_status()
     return r.json()
 
+def find_latest_available_day(lang: str, ua: str) -> dt.date | None:
+    """
+    Probe backwards from today to find the most recent date
+    for which the most-read endpoint exists.
+    """
+    today = dt.date.today()
 
-def normalize(day: dt.date, payload: Dict[str, Any]) -> List[Row]:
-    out: List[Row] = []
+    for delta in range(LOOKBACK_DAYS):
+        day = today - dt.timedelta(days=delta)
+        url = MOST_READ_DAY_URL.format(
+            lang=lang,
+            yyyy=day.year,
+            mm=f"{day.month:02}",
+            dd=f"{day.day:02}",
+        )
+        try:
+            fetch_json(url, ua)
+            return day
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                continue
+            raise
+
+    return None
+
+def normalize_most_read(day: dt.date, payload: Dict[str, Any]) -> List[Row]:
+    rows: List[Row] = []
     date_s = day.isoformat()
 
-    # 1) Today's featured article (tfa)
-    tfa = payload.get("tfa")
-    if isinstance(tfa, dict):
-        title = (tfa.get("title") or "").strip()
-        text = (tfa.get("extract") or tfa.get("description") or "").strip()
-        url = (safe_get(tfa, "content_urls", "desktop", "page") or "").strip()
-        if title:
-            out.append(Row(date_s, "tfa", title, text, url))
+    for rank, a in enumerate(payload.get("articles", []), start=1):
+        rows.append(
+            Row(
+                date=date_s,
+                section="most_read",
+                title=a.get("title", ""),
+                extra=f"rank={rank};views={a.get('views', 0)}",
+                url=a.get("content_urls", {})
+                    .get("desktop", {})
+                    .get("page", ""),
+            )
+        )
+    return rows
 
-    # 2) In the news (news)
-    news = payload.get("news")
-    if isinstance(news, list):
-        for item in news:
-            if not isinstance(item, dict):
-                continue
-
-            story_text = (item.get("story_text") or "").strip()
-            if story_text:
-                out.append(Row(date_s, "news_story", "(news story)", story_text, ""))
-
-            links = item.get("links") or []
-            if isinstance(links, list):
-                for link in links:
-                    if not isinstance(link, dict):
-                        continue
-                    title = (link.get("title") or "").strip()
-                    url = (safe_get(link, "content_urls", "desktop", "page") or "").strip()
-                    if title:
-                        out.append(Row(date_s, "news_link", title, "", url))
-
-    # 3) Did you know (dyk)
-    dyk = payload.get("dyk")
-    if isinstance(dyk, dict):
-        facts = dyk.get("facts")
-        if isinstance(facts, list):
-            for f in facts:
-                if not isinstance(f, dict):
-                    continue
-                text = (f.get("text") or f.get("html") or "").strip()
-                title = (f.get("title") or "(dyk fact)").strip()
-                url = (safe_get(f, "content_urls", "desktop", "page") or "").strip()
-                if text or title:
-                    out.append(Row(date_s, "dyk", title, text, url))
-        else:
-            content = (dyk.get("content") or dyk.get("text") or "")
-            content_s = str(content).strip()
-            if content_s:
-                out.append(Row(date_s, "dyk", "(dyk)", content_s, ""))
-
-    # 4) On this day (onthisday)
-    otd = payload.get("onthisday")
-    if isinstance(otd, list):
-        for ev in otd:
-            if not isinstance(ev, dict):
-                continue
-            year = ev.get("year")
-            text = (ev.get("text") or "").strip()
-            title = (f"{year}: {text}" if year else text[:120]).strip() or "(event)"
-            out.append(Row(date_s, "onthisday", title, text, ""))
-
-    return out
-
+# ================== DATABASE ==================
 
 def init_db(con: sqlite3.Connection) -> None:
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS featured (
-            date TEXT NOT NULL,
-            section TEXT NOT NULL,
-            title TEXT NOT NULL,
-            text TEXT NOT NULL,
-            url TEXT NOT NULL,
-            PRIMARY KEY (date, section, title, url)
-        );
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_featured_date ON featured(date);")
-    con.commit()
-
-
-def upsert_rows(con: sqlite3.Connection, rows: List[Row]) -> int:
-    init_db(con)
-    cur = con.cursor()
-    cur.executemany(
-        "INSERT OR IGNORE INTO featured(date, section, title, text, url) VALUES (?,?,?,?,?)",
-        [(r.date, r.section, r.title, r.text, r.url) for r in rows],
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wiki (
+            date TEXT,
+            section TEXT,
+            title TEXT,
+            extra TEXT,
+            url TEXT,
+            PRIMARY KEY (date, section, title)
+        )
+        """
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wiki_date ON wiki(date)"
     )
     con.commit()
-    return cur.rowcount
 
+def upsert(con: sqlite3.Connection, rows: List[Row]) -> None:
+    init_db(con)
+    con.executemany(
+        "INSERT OR IGNORE INTO wiki VALUES (?,?,?,?,?)",
+        [(r.date, r.section, r.title, r.extra, r.url) for r in rows],
+    )
+    con.commit()
 
-def get_max_date_in_db(db_path: str) -> Optional[dt.date]:
-    if not os.path.exists(db_path):
-        return None
-    con = sqlite3.connect(db_path)
-    try:
-        init_db(con)
-        row = con.execute("SELECT MAX(date) FROM featured;").fetchone()
-        if not row or row[0] is None:
-            return None
-        return parse_date(row[0])
-    finally:
-        con.close()
+# ================== AGGREGATION ==================
 
-
-def compute_catchup_range(db_path: str, floor_start: dt.date, today: dt.date) -> Tuple[dt.date, dt.date]:
-    max_d = get_max_date_in_db(db_path)
-    if max_d is None:
-        return floor_start, today
-
-    next_d = max_d + dt.timedelta(days=1)
-    if next_d > today:
-        return today, today
-
-    if next_d < floor_start:
-        next_d = floor_start
-    return next_d, today
-
-
-def export_outputs(db_path: str, out_dir: str, logger: Optional[logging.Logger] = None) -> None:
+def export_month(con: sqlite3.Connection, year: int, month: int, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    con = sqlite3.connect(db_path)
 
-    # 1) Daily counts CSV (always)
-    q_counts = """
-      SELECT date, section, COUNT(*) as count
-      FROM featured
-      GROUP BY date, section
-      ORDER BY date ASC, section ASC
+    start = f"{year}-{month:02}-01"
+    end_date = (
+        dt.date(year, month, 28) + dt.timedelta(days=4)
+    ).replace(day=1) - dt.timedelta(days=1)
+    end = end_date.isoformat()
+
+    q = """
+    SELECT
+        title,
+        SUM(CAST(substr(extra, instr(extra,'views=')+6) AS INTEGER)) AS views,
+        COUNT(*) AS days_present,
+        MAX(url) AS url
+    FROM wiki
+    WHERE section='most_read'
+      AND date BETWEEN ? AND ?
+    GROUP BY title
+    ORDER BY views DESC
     """
-    rows = con.execute(q_counts).fetchall()
-    csv_path = os.path.join(out_dir, "featured_daily_counts.csv")
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write("date,section,count\n")
-        for d, s, c in rows:
-            f.write(f"{d},{s},{c}\n")
 
-    # 2) Latest rows parquet (optional); fallback to CSV if parquet deps missing
-    pd = _try_import_pandas()
-    if pd is not None:
-        df = pd.read_sql_query("SELECT * FROM featured ORDER BY date DESC", con)
-        try:
-            parquet_path = os.path.join(out_dir, "featured_latest.parquet")
-            df.to_parquet(parquet_path, index=False)
-        except Exception:
-            latest_csv = os.path.join(out_dir, "featured_latest.csv")
-            df.to_csv(latest_csv, index=False)
+    rows = con.execute(q, (start, end)).fetchall()
 
-    con.close()
+    items = []
+    for title, views, days, url in rows:
+        items.append(
+            {
+                "title": title,
+                "views": views,
+                "days_present": days,
+                "avg_daily_views": round(views / days, 1) if days else 0,
+                "url": url,
+            }
+        )
 
-    if logger:
-        logger.info(f"Exports written to {out_dir}")
+    data = {
+        "schema_version": 1,
+        "year": year,
+        "month": month,
+        "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+        "items": items,
+    }
 
+    with open(
+        os.path.join(out_dir, "most_read.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    summary = {
+        "year": year,
+        "month": month,
+        "total_articles": len(items),
+        "top_article": items[0]["title"] if items else None,
+        "top_views": items[0]["views"] if items else None,
+    }
+
+    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+# ================== MAIN ==================
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", default="en")
-
-    ap.add_argument("--db", default="data/featured.sqlite")
-    ap.add_argument("--out_dir", default="data")
-    ap.add_argument("--user_agent", default=os.getenv("WIKI_UA", DEFAULT_UA))
-
-    ap.add_argument("--floor_start", default="2026-01-01", help="Earliest allowed start YYYY-MM-DD")
-    ap.add_argument("--end", default=dt.date.today().isoformat(), help="YYYY-MM-DD (usually today)")
-
-    ap.add_argument(
-        "--mode",
-        choices=["catchup", "range"],
-        default="catchup",
-        help="catchup: fetch missing days since last DB date; range: use --start/--end",
-    )
-    ap.add_argument("--start", default=None, help="YYYY-MM-DD (only used when --mode=range)")
-
+    ap.add_argument("--db", default="data/wiki.sqlite")
+    ap.add_argument("--export_monthlies", action="store_true")
+    ap.add_argument("--site_dir", default="site/public/data")
     args = ap.parse_args()
 
     logger = setup_logger()
-    logger.info("Starting Wikipedia featured ingestion")
+    lang = args.lang.split("_")[0]
 
-    # Normalize lang: accept en_IN.UTF-8, hi_IN.UTF-8, etc.
-    orig_lang = args.lang
-    args.lang = (args.lang.split(".")[0]).split("_")[0]
-    if args.lang != orig_lang:
-        logger.info(f"Normalized language '{orig_lang}' → '{args.lang}'")
+    os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
+    con = sqlite3.connect(args.db)
 
-    # Define paths early & create dirs once
-    db_path = args.db
-    out_dir = args.out_dir
+    # ---- Find & ingest latest available day ----
+    latest_day = find_latest_available_day(lang, DEFAULT_UA)
 
-    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
+    if latest_day is None:
+        logger.warning(
+        f"No most-read data available in the last {LOOKBACK_DAYS} days. Exiting."
+    )
+    return
+    logger.info(f"Latest available most-read date: {latest_day}")
 
-    logger.info(f"DB path: {db_path}")
-    logger.info(f"Output directory: {out_dir}")
 
-    floor_start = parse_date(args.floor_start)
-    end = parse_date(args.end)
-    if end < floor_start:
-        raise SystemExit("end date must be >= floor_start")
+    payload = fetch_json(
+        MOST_READ_DAY_URL.format(
+            lang=lang,
+            yyyy=latest_day.year,
+            mm=f"{latest_day.month:02}",
+            dd=f"{latest_day.day:02}",
+        ),
+        DEFAULT_UA,
+    )
 
-    if args.mode == "range":
-        if not args.start:
-            raise SystemExit("--start is required when --mode=range")
-        start = parse_date(args.start)
-        if start < floor_start:
-            start = floor_start
-    else:
-        start, end = compute_catchup_range(db_path, floor_start, end)
+    rows = normalize_most_read(latest_day, payload)
+    upsert(con, rows)
+    logger.info(f"Ingested {len(rows)} articles for {latest_day}")
 
-    logger.info(f"Mode: {args.mode}")
-    logger.info(f"Fetch range: {start.isoformat()} → {end.isoformat()}")
+    # ---- Export monthlies if requested ----
+    if args.export_monthlies:
+        logger.info("Exporting monthly datasets")
+        cur = con.execute("SELECT DISTINCT substr(date,1,7) FROM wiki")
+        for (ym,) in cur.fetchall():
+            y, m = map(int, ym.split("-"))
+            out = os.path.join(args.site_dir, str(y), f"{m:02}")
+            export_month(con, y, m, out)
+            logger.info(f"Exported {y}-{m:02}")
 
-    all_rows: List[Row] = []
-    for day in daterange(start, end):
-        logger.info(f"Fetching {args.lang} / {day.isoformat()}")
-        try:
-            payload = fetch_featured(args.lang, day, args.user_agent)
-            rows = normalize(day, payload)
-            all_rows.extend(rows)
-            logger.info(f"  Parsed {len(rows)} rows")
-        except requests.HTTPError as e:
-            logger.error(f"  HTTP error for {day}: {e}")
-            raise
-        except Exception:
-            logger.exception(f"  Unexpected error on {day}")
-            raise
-
-    con = sqlite3.connect(db_path)
-    inserted = upsert_rows(con, all_rows)
     con.close()
-
-    logger.info(f"Rows parsed total: {len(all_rows)}")
-    logger.info(f"Rows inserted (new): {inserted}")
-    logger.info("Database updated")
-
-    export_outputs(db_path, out_dir, logger)
-
+    logger.info("Done.")
 
 if __name__ == "__main__":
     main()

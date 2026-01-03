@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Wikipedia’s Most-Read Articles · January 2026</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Vega stack -->
+  <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background: #0b0c0f;
+      color: #eaeaf0;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+    }
+    header {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      font-size: 30px;
+      font-weight: 750;
+      letter-spacing: -0.02em;
+      margin: 0;
+      line-height: 1.15;
+    }
+    p.subtitle {
+      margin: 0;
+      color: #a8abb5;
+      max-width: 760px;
+      line-height: 1.6;
+      font-size: 15px;
+    }
+    .meta {
+      margin-top: 8px;
+      color: #8b8e99;
+      font-size: 13px;
+    }
+    .card {
+      border: 1px solid #1b1d25;
+      border-radius: 16px;
+      padding: 18px 18px 8px;
+      background: rgba(255,255,255,0.02);
+      box-shadow: 0 10px 35px rgba(0,0,0,0.25);
+    }
+    footer {
+      margin-top: 42px;
+      font-size: 13px;
+      color: #8b8e99;
+      line-height: 1.6;
+    }
+    a { color: #9bb6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+
+<body>
+<main>
+  <header>
+    <h1>Wikipedia’s Most-Read Articles<br>January 2026</h1>
+    <p class="subtitle">
+      A monthly snapshot of collective attention: not what was “most important”, but what people repeatedly chose to read.
+      Bars represent <b>total views across the month</b>. Click any bar to open the article.
+    </p>
+    <div class="meta" id="metaLine">Loading summary…</div>
+  </header>
+
+  <div class="card">
+    <div id="viz"></div>
+  </div>
+
+  <footer>
+    Data source: Wikimedia Feed API (Most Read) · Aggregated monthly.<br>
+    This page is static and loads precomputed JSON from this repository.
+  </footer>
+</main>
+
+<script>
+async function loadSummary() {
+  try {
+    const res = await fetch("../../public/data/2026/01/summary.json");
+    if (!res.ok) return;
+    const s = await res.json();
+    if (s.top_article && s.top_views) {
+      const viewsFmt = new Intl.NumberFormat().format(s.top_views);
+      document.getElementById("metaLine").textContent =
+        `Top article: "${s.top_article}" · ${viewsFmt} views`;
+    } else {
+      document.getElementById("metaLine").textContent = "No summary available yet.";
+    }
+  } catch {
+    document.getElementById("metaLine").textContent = "No summary available yet.";
+  }
+}
+
+const spec = {
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+
+  "data": {
+    "url": "../../public/data/2026/01/most_read.json",
+    "format": { "property": "items" }
+  },
+
+  "transform": [
+    {
+      "window": [{"op": "rank", "as": "rank"}],
+      "sort": [{"field": "views", "order": "descending"}]
+    },
+    { "filter": "datum.rank <= 20" }
+  ],
+
+  "width": "container",
+  "height": 520,
+
+  "layer": [
+    /* Bars */
+    {
+      "mark": { "type": "bar", "cornerRadiusEnd": 4 },
+      "encoding": {
+        "y": {
+          "field": "title",
+          "type": "nominal",
+          "sort": "-x",
+          "title": null,
+          "axis": {
+            "labelLimit": 460,
+            "labelColor": "#d9dbe3",
+            "labelPadding": 8,
+            "ticks": false,
+            "domain": false
+          }
+        },
+        "x": {
+          "field": "views",
+          "type": "quantitative",
+          "title": null,
+          "axis": {
+            "grid": true,
+            "gridColor": "#20222b",
+            "labelColor": "#b6b9c3",
+            "format": ","
+          }
+        },
+        "tooltip": [
+          { "field": "title", "type": "nominal", "title": "Article" },
+          { "field": "views", "type": "quantitative", "title": "Total views", "format": "," },
+          { "field": "days_present", "type": "quantitative", "title": "Days appeared" },
+          { "field": "avg_daily_views", "type": "quantitative", "title": "Avg daily views", "format": "," }
+        ],
+        "opacity": {
+          "condition": { "test": "datum.rank <= 3", "value": 1 },
+          "value": 0.72
+        }
+      }
+    },
+
+    /* Top-3 labels at bar end */
+    {
+      "transform": [{ "filter": "datum.rank <= 3" }],
+      "mark": { "type": "text", "align": "left", "dx": 6, "fontSize": 12, "fontWeight": 700 },
+      "encoding": {
+        "y": { "field": "title", "type": "nominal", "sort": "-x" },
+        "x": { "field": "views", "type": "quantitative" },
+        "text": { "field": "views", "type": "quantitative", "format": "," },
+        "color": { "value": "#dfe6ff" }
+      }
+    }
+  ],
+
+  "config": {
+    "background": "#0b0c0f",
+    "bar": { "color": "#7aa2ff" },
+    "view": { "stroke": null },
+    "axis": { "labelFontSize": 12, "titleFontSize": 12 }
+  }
+};
+
+loadSummary();
+
+vegaEmbed("#viz", spec, { actions: false }).then(({ view }) => {
+  // Click a bar -> open Wikipedia article
+  view.addEventListener("click", (event, item) => {
+    if (!item || !item.datum) return;
+    const url = item.datum.url;
+    if (url) window.open(url, "_blank", "noopener,noreferrer");
+  });
+});
+</script>
+</body>
+</html>
