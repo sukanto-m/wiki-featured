@@ -1,12 +1,82 @@
-cat > docs/index.html <<'EOF'
 <!doctype html>
 <html lang="en">
+<head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Wikipedia Attention Archive</title>
-  <meta http-equiv="refresh" content="0; url=./2026/01/">
-  <body style="font-family:system-ui;background:#0b0c0f;color:#eaeaf0;padding:32px">
-    <p>Redirecting to January 2026…</p>
-  </body>
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background: #0b0c0f;
+      color: #eaeaf0;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+    }
+    main {
+      text-align: center;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 12px;
+      letter-spacing: -0.02em;
+    }
+    p {
+      color: #a8abb5;
+      font-size: 15px;
+      margin: 6px 0;
+    }
+    a {
+      color: #9bb6ff;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .status {
+      margin-top: 18px;
+      font-size: 14px;
+      color: #8b8e99;
+    }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>Wikipedia Attention Archive</h1>
+  <p>Tracking what the world chose to read.</p>
+  <p id="latest">Checking latest available month…</p>
+  <div class="status">Data updates automatically.</div>
+</main>
+
+<script>
+async function findLatestMonth() {
+  // We probe months in descending order, starting from now.
+  const now = new Date();
+  const year = now.getUTCFullYear();
+
+  for (let m = now.getUTCMonth() + 1; m >= 1; m--) {
+    const mm = String(m).padStart(2, "0");
+    const url = `./${year}/${mm}/summary.json`;
+
+    try {
+      const res = await fetch(url, { method: "HEAD" });
+      if (res.ok) {
+        const el = document.getElementById("latest");
+        el.innerHTML = `Latest available month: <a href="./${year}/${mm}/">${year}-${mm}</a>`;
+        return;
+      }
+    } catch (_) {}
+  }
+
+  document.getElementById("latest").textContent =
+    "No monthly data published yet.";
+}
+
+findLatestMonth();
+</script>
+</body>
 </html>
-EOF
